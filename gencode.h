@@ -268,7 +268,6 @@ struct block {
 	struct block *head;
 	struct block *link;	/* link field used by optimizer */
 	uset dom;
-	uset closure;
 	struct edge *in_edges;	/* first edge in the set (linked list) of edges with this as a successor */
 	atomset def, kill;
 	atomset in_use;

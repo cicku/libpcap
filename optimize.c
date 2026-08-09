@@ -290,7 +290,6 @@ typedef struct {
 }
 
 	uset all_dom_sets;
-	uset all_closure_sets;
 	uset all_edge_sets;
 
 #define MODULUS 213
@@ -454,37 +453,6 @@ find_edom(opt_state_t *opt_state, struct block *root)
 		for (b = opt_state->levels[level]; b != 0; b = b->link) {
 			propedom(opt_state, &b->et);
 			propedom(opt_state, &b->ef);
-		}
-	}
-}
-
-/*
- * Find the backwards transitive closure of the flow graph.  These sets
- * are backwards in the sense that we find the set of nodes that reach
- * a given node, not the set of nodes that can be reached by a node.
- *
- * Assumes graph has been leveled.
- */
-static void
-find_closure(opt_state_t *opt_state, struct block *root)
-{
-	int level;
-	struct block *b;
-
-	/*
-	 * Initialize sets to contain no nodes.
-	 */
-	memset((char *)opt_state->all_closure_sets, 0,
-	      opt_state->n_blocks * opt_state->nodewords * sizeof(*opt_state->all_closure_sets));
-
-	/* root->level is the highest level no found. */
-	for (level = root->level; level >= 0; --level) {
-		for (b = opt_state->levels[level]; b; b = b->link) {
-			SET_INSERT(b->closure, b->id);
-			if (JT(b) == 0)
-				continue;
-			SET_UNION(JT(b)->closure, b->closure, opt_state->nodewords);
-			SET_UNION(JF(b)->closure, b->closure, opt_state->nodewords);
 		}
 	}
 }
@@ -2200,7 +2168,6 @@ opt_loop(opt_state_t *opt_state, struct icode *ic, int do_stmts)
 		opt_state->done = 1;
 		find_levels(opt_state, ic);
 		find_dom(opt_state, ic->root);
-		find_closure(opt_state, ic->root);
 		find_ud(opt_state, ic->root);
 		find_edom(opt_state, ic->root);
 		opt_blks(opt_state, ic, do_stmts);
@@ -2584,8 +2551,8 @@ opt_init(opt_state_t *opt_state, struct icode *ic)
 	 * Make sure the total memory required for that doesn't
 	 * overflow.
 	 */
-	block_memsize = (size_t)2 * product * sizeof(*opt_state->space);
-	if ((block_memsize / product) != 2 * sizeof(*opt_state->space)) {
+	block_memsize = (size_t)product * sizeof(*opt_state->space);
+	if ((block_memsize / product) != sizeof(*opt_state->space)) {
 		opt_error(opt_state, "filter is too complex to optimize");
 	}
 
@@ -2625,11 +2592,6 @@ opt_init(opt_state_t *opt_state, struct icode *ic)
 	opt_state->all_dom_sets = p;
 	for (i = 0; i < n; ++i) {
 		opt_state->blocks[i]->dom = p;
-		p += opt_state->nodewords;
-	}
-	opt_state->all_closure_sets = p;
-	for (i = 0; i < n; ++i) {
-		opt_state->blocks[i]->closure = p;
 		p += opt_state->nodewords;
 	}
 	opt_state->all_edge_sets = p;
