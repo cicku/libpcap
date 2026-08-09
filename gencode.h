@@ -242,7 +242,6 @@ typedef bpf_u_int32 *uset;
 struct edge {
 	u_int id;
 	int code;		/* opcode for branch corresponding to this edge */
-	uset edom;
 	struct block *succ;	/* successor vertex */
 	struct block *pred;	/* predecessor vertex */
 	struct edge *next;	/* link list of incoming edges for a node */
@@ -268,6 +267,7 @@ struct block {
 	struct block *head;
 	struct block *link;	/* link field used by optimizer */
 	uset dom;
+	uset edom;		/* edge dominators, shared by this block's two edges */
 	struct edge *in_edges;	/* first edge in the set (linked list) of edges with this as a successor */
 	atomset def, kill;
 	atomset in_use;

@@ -415,14 +415,28 @@ find_dom(opt_state_t *opt_state, struct block *root)
 	}
 }
 
+/*
+ * Intersect the shared set of the successor of 'ep' with the dominator
+ * set of 'ep' itself, which is the shared set of the block 'ep' leaves
+ * plus 'ep'.  The bit for 'ep' lives in one word only, so rather than
+ * setting it in a copy of the source set, or it in as that word goes by.
+ */
 static void
 propedom(opt_state_t *opt_state, struct edge *ep)
 {
-	SET_INSERT(ep->edom, ep->id);
-	if (ep->succ) {
-		SET_INTERSECT(ep->succ->et.edom, ep->edom, opt_state->edgewords);
-		SET_INTERSECT(ep->succ->ef.edom, ep->edom, opt_state->edgewords);
-	}
+	u_int i, selfword;
+	bpf_u_int32 selfbit;
+	uset dst, src;
+
+	if (ep->succ == 0)
+		return;
+
+	selfword = (u_int)ep->id / BITS_PER_WORD;
+	selfbit = (bpf_u_int32)1 << ((u_int)ep->id % BITS_PER_WORD);
+	dst = ep->succ->edom;
+	src = ep->pred->edom;
+	for (i = 0; i < opt_state->edgewords; ++i)
+		dst[i] &= src[i] | (i == selfword ? selfbit : 0);
 }
 
 /*
@@ -441,14 +455,13 @@ find_edom(opt_state_t *opt_state, struct block *root)
 	/*
 	 * In opt_init(), we've made sure the product doesn't overflow.
 	 */
-	for (i = opt_state->n_edges * opt_state->edgewords; i != 0; ) {
+	for (i = opt_state->n_blocks * opt_state->edgewords; i != 0; ) {
 		--i;
 		x[i] = 0xFFFFFFFFU;
 	}
 
 	/* root->level is the highest level no found. */
-	memset(root->et.edom, 0, opt_state->edgewords * sizeof(*(uset)0));
-	memset(root->ef.edom, 0, opt_state->edgewords * sizeof(*(uset)0));
+	memset(root->edom, 0, opt_state->edgewords * sizeof(*(uset)0));
 	for (level = root->level; level >= 0; --level) {
 		for (b = opt_state->levels[level]; b != 0; b = b->link) {
 			propedom(opt_state, &b->et);
@@ -1651,6 +1664,8 @@ opt_j(opt_state_t *opt_state, struct edge *ep)
 {
 	u_int i, k;
 	struct block *target;
+	u_int selfword = (u_int)ep->id / BITS_PER_WORD;
+	bpf_u_int32 selfbit = (bpf_u_int32)1 << ((u_int)ep->id % BITS_PER_WORD);
 
 	/*
 	 * Does this edge go to a block where, if the test
@@ -1708,8 +1723,15 @@ opt_j(opt_state_t *opt_state, struct edge *ep)
 	 */
  top:
 	for (i = 0; i < opt_state->edgewords; ++i) {
-		/* i'th word in the bitset of dominators */
-		bpf_u_int32 x = ep->edom[i];
+		/*
+		 * i'th word in the bitset of dominators, which is the
+		 * one the block shares between its two edges, plus this
+		 * edge itself.
+		 */
+		bpf_u_int32 x = ep->pred->edom[i];
+
+		if (i == selfword)
+			x |= selfbit;
 
 		while (x != 0) {
 			/* Find the next dominator in that word and mark it as found */
@@ -2557,12 +2579,12 @@ opt_init(opt_state_t *opt_state, struct icode *ic)
 	}
 
 	/*
-	 * Make sure opt_state->n_edges * opt_state->edgewords fits
+	 * Make sure opt_state->n_blocks * opt_state->edgewords fits
 	 * in a u_int; we use it as a u_int number-of-iterations
 	 * value.
 	 */
-	product = opt_state->n_edges * opt_state->edgewords;
-	if ((product / opt_state->n_edges) != opt_state->edgewords) {
+	product = opt_state->n_blocks * opt_state->edgewords;
+	if ((product / opt_state->n_blocks) != opt_state->edgewords) {
 		opt_error(opt_state, "filter is too complex to optimize");
 	}
 
@@ -2598,9 +2620,7 @@ opt_init(opt_state_t *opt_state, struct icode *ic)
 	for (i = 0; i < n; ++i) {
 		struct block *b = opt_state->blocks[i];
 
-		b->et.edom = p;
-		p += opt_state->edgewords;
-		b->ef.edom = p;
+		b->edom = p;
 		p += opt_state->edgewords;
 		b->et.id = i;
 		opt_state->edges[i] = &b->et;
