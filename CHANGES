@@ -65,6 +65,10 @@ DayOfTheWeek, Month DD, YYYY / The Tcpdump Group
         removing the closure sets, which nothing read, and sharing one
         edge dominator set between the two edges of a block. (issue
         #1255)
+      Keep dominators as a tree rather than as a bit vector per block
+        or per edge, so that the memory the optimizer needs grows with
+        the size of the filter rather than with its square. (issue
+        #1255)
     Capture file reading:
       Fix misaligned accesses in processing Linux USB captures (issue
         #1634, reported by FuzzAnything Organization

@@ -97,60 +97,6 @@ pcap_set_print_dot_graph(int value)
 #endif
 
 /*
- * lowest_set_bit().
- *
- * Takes a 32-bit integer as an argument.
- *
- * If handed a non-zero value, returns the index of the lowest set bit,
- * counting upwards from zero.
- *
- * If handed zero, the results are platform- and compiler-dependent.
- * Keep it out of the light, don't give it any water, don't feed it
- * after midnight, and don't pass zero to it.
- *
- * This is the same as the count of trailing zeroes in the word.
- */
-#if PCAP_IS_AT_LEAST_GNUC_VERSION(3,4)
-  /*
-   * GCC 3.4 and later; we have __builtin_ctz().
-   */
-  #define lowest_set_bit(mask) ((u_int)__builtin_ctz(mask))
-#elif defined(_MSC_VER)
-  /*
-   * Visual Studio; we support only 2015 and later, so use
-   * _BitScanForward().
-   */
-#include <intrin.h>
-
-#ifndef __clang__
-#pragma intrinsic(_BitScanForward)
-#endif
-
-static __forceinline u_int
-lowest_set_bit(int mask)
-{
-	unsigned long bit;
-
-	/*
-	 * Don't sign-extend mask if long is longer than int.
-	 * (It's currently not, in MSVC, even on 64-bit platforms, but....)
-	 */
-	if (_BitScanForward(&bit, (unsigned int)mask) == 0)
-		abort();	/* mask is zero */
-	return (u_int)bit;
-}
-#else
-  /*
-   * POSIX.1-2001 says ffs() is in <strings.h>.  Every supported non-Windows OS
-   * (including Linux with musl libc and uclibc-ng) has the header and (except
-   * HP-UX) declares the function there.  HP-UX declares the function in
-   * <string.h>, which has already been included.
-   */
-  #include <strings.h>
-  #define lowest_set_bit(mask)	((u_int)(ffs((mask)) - 1))
-#endif
-
-/*
  * Represents a deleted instruction.
  */
 #define NOP -1
@@ -232,65 +178,10 @@ typedef struct {
 	 * A bit vector set representation of the dominators.
 	 * We round up the set size to the next power of two.
 	 */
-	u_int nodewords;	/* number of 32-bit words for a bit vector of "number of nodes" bits; guaranteed to be > 0 */
-	u_int edgewords;	/* number of 32-bit words for a bit vector of "number of edges" bits; guaranteed to be > 0 */
 	struct block **levels;
-	bpf_u_int32 *space;
 
-#define BITS_PER_WORD (8*sizeof(bpf_u_int32))
-/*
- * True if a is in uset {p}
- */
-#define SET_MEMBER(p, a) \
-((p)[(unsigned)(a) / BITS_PER_WORD] & ((bpf_u_int32)1 << ((unsigned)(a) % BITS_PER_WORD)))
-
-/*
- * Add 'a' to uset p.
- */
-#define SET_INSERT(p, a) \
-(p)[(unsigned)(a) / BITS_PER_WORD] |= ((bpf_u_int32)1 << ((unsigned)(a) % BITS_PER_WORD))
-
-/*
- * Delete 'a' from uset p.
- */
-#define SET_DELETE(p, a) \
-(p)[(unsigned)(a) / BITS_PER_WORD] &= ~((bpf_u_int32)1 << ((unsigned)(a) % BITS_PER_WORD))
-
-/*
- * a := a intersect b
- * n must be guaranteed to be > 0
- */
-#define SET_INTERSECT(a, b, n)\
-{\
-	bpf_u_int32 *_x = a, *_y = b;\
-	u_int _n = n;\
-	do *_x++ &= *_y++; while (--_n != 0);\
-}
-
-/*
- * a := a - b
- * n must be guaranteed to be > 0
- */
-#define SET_SUBTRACT(a, b, n)\
-{\
-	bpf_u_int32 *_x = a, *_y = b;\
-	u_int _n = n;\
-	do *_x++ &=~ *_y++; while (--_n != 0);\
-}
-
-/*
- * a := a union b
- * n must be guaranteed to be > 0
- */
-#define SET_UNION(a, b, n)\
-{\
-	bpf_u_int32 *_x = a, *_y = b;\
-	u_int _n = n;\
-	do *_x++ |= *_y++; while (--_n != 0);\
-}
-
-	uset all_dom_sets;
-	uset all_edge_sets;
+	struct edge **edom_list;	/* scratch used by opt_j() */
+	struct block **dom_stack;	/* scratch used by find_dom() */
 
 #define MODULUS 213
 	struct valnode *hashtbl[MODULUS];
@@ -377,95 +268,174 @@ find_levels(opt_state_t *opt_state, struct icode *ic)
  * Find dominator relationships.
  * Assumes graph has been leveled.
  */
+/*
+ * Return the deepest block that dominates both 'a' and 'b', or NULL if
+ * they have no dominator in common.
+ */
+static struct block *
+block_nca(struct block *a, struct block *b)
+{
+	while (a != b) {
+		if (a->dom_depth < b->dom_depth)
+			b = b->dom_parent;
+		else
+			a = a->dom_parent;
+		if (a == 0 || b == 0)
+			return 0;
+	}
+	return a;
+}
+
+/*
+ * Return true if 'b' dominates 'x'.  A block dominates itself.  The
+ * blocks of the dominator tree are numbered in depth-first order, so
+ * 'x' is in the subtree of 'b' exactly when its number is in the range
+ * 'b' spans.  Unreachable blocks have number 0 and are in no subtree.
+ */
+static int
+block_dominates(struct block *b, struct block *x)
+{
+	return b->dom_first <= x->dom_first && x->dom_first <= b->dom_last;
+}
+
 static void
 find_dom(opt_state_t *opt_state, struct block *root)
 {
-	u_int i;
+	u_int i, counter, sp;
 	int level;
-	struct block *b;
-	bpf_u_int32 *x;
+	struct block *b, *ch, *cur;
 
 	/*
-	 * Initialize sets to contain all nodes.
+	 * A block is dominated by itself and by every block on the path
+	 * from the root of the dominator tree down to it, so what is kept
+	 * is the immediate dominator of each block, and a depth-first
+	 * numbering of the tree for block_dominates() to compare.
+	 *
+	 * The immediate dominator of a block is the deepest block
+	 * dominating all of its predecessors, which have to be found first
+	 * as the graph may have changed since the last time.
 	 */
-	x = opt_state->all_dom_sets;
-	/*
-	 * In opt_init(), we've made sure the product doesn't overflow.
-	 */
-	i = opt_state->n_blocks * opt_state->nodewords;
-	while (i != 0) {
-		--i;
-		*x++ = 0xFFFFFFFFU;
-	}
-	/* Root starts off empty. */
-	for (i = opt_state->nodewords; i != 0;) {
-		--i;
-		root->dom[i] = 0;
+	find_inedges(opt_state, root);
+
+	for (i = 0; i < opt_state->n_blocks; ++i) {
+		opt_state->blocks[i]->dom_first = 0;
+		opt_state->blocks[i]->dom_child = 0;
 	}
 
-	/* root->level is the highest level no found. */
+	root->dom_parent = 0;
+	root->dom_depth = 1;
 	for (level = root->level; level >= 0; --level) {
 		for (b = opt_state->levels[level]; b; b = b->link) {
-			SET_INSERT(b->dom, b->id);
-			if (JT(b) == 0)
+			struct edge *ep;
+			struct block *nca;
+
+			if (b == root || b->in_edges == 0) {
+				b->dom_parent = 0;
+				b->dom_depth = 1;
 				continue;
-			SET_INTERSECT(JT(b)->dom, b->dom, opt_state->nodewords);
-			SET_INTERSECT(JF(b)->dom, b->dom, opt_state->nodewords);
+			}
+			nca = b->in_edges->pred;
+			for (ep = b->in_edges; ep != 0; ep = ep->next)
+				if ((nca = block_nca(nca, ep->pred)) == 0)
+					break;
+			b->dom_parent = nca;
+			b->dom_depth = nca == 0 ? 1 : nca->dom_depth + 1;
+		}
+	}
+
+	/*
+	 * Link each block into the child list of its immediate dominator,
+	 * then number the tree so that a dominator test is a comparison of
+	 * two intervals rather than a walk up the tree.
+	 */
+	for (level = 0; level <= root->level; ++level) {
+		for (b = opt_state->levels[level]; b; b = b->link) {
+			if (b == root || b->dom_parent == 0)
+				continue;
+			b->dom_sib = b->dom_parent->dom_child;
+			b->dom_parent->dom_child = b;
+		}
+	}
+
+	counter = 0;
+	root->dom_first = ++counter;
+	opt_state->dom_stack[0] = root;
+	sp = 1;
+	while (sp != 0) {
+		cur = opt_state->dom_stack[sp - 1];
+		if ((ch = cur->dom_child) != 0) {
+			/* Consume the child list as the DFS cursor. */
+			cur->dom_child = ch->dom_sib;
+			ch->dom_first = ++counter;
+			opt_state->dom_stack[sp++] = ch;
+		} else {
+			cur->dom_last = counter;
+			--sp;
 		}
 	}
 }
 
-/*
- * Intersect the shared set of the successor of 'ep' with the dominator
- * set of 'ep' itself, which is the shared set of the block 'ep' leaves
- * plus 'ep'.  The bit for 'ep' lives in one word only, so rather than
- * setting it in a copy of the source set, or it in as that word goes by.
- */
-static void
-propedom(opt_state_t *opt_state, struct edge *ep)
+static u_int
+edge_depth(struct edge *ep)
 {
-	u_int i, selfword;
-	bpf_u_int32 selfbit;
-	uset dst, src;
+	return ep->pred->edom_depth;
+}
 
-	if (ep->succ == 0)
-		return;
-
-	selfword = (u_int)ep->id / BITS_PER_WORD;
-	selfbit = (bpf_u_int32)1 << ((u_int)ep->id % BITS_PER_WORD);
-	dst = ep->succ->edom;
-	src = ep->pred->edom;
-	for (i = 0; i < opt_state->edgewords; ++i)
-		dst[i] &= src[i] | (i == selfword ? selfbit : 0);
+/*
+ * Return the deepest edge that dominates both 'a' and 'b', or NULL if
+ * they have no dominator in common.
+ */
+static struct edge *
+edge_nca(struct edge *a, struct edge *b)
+{
+	while (a != b) {
+		if (edge_depth(a) < edge_depth(b))
+			b = b->pred->edom_parent;
+		else
+			a = a->pred->edom_parent;
+		if (a == 0 || b == 0)
+			return 0;
+	}
+	return a;
 }
 
 /*
  * Compute edge dominators.
  * Assumes graph has been leveled and predecessors established.
+ *
+ * The dominators of an edge are the edges on the path from the root of
+ * the edge dominator tree down to it, so what is kept is the edge that
+ * immediately dominates the two edges leaving each block, and their
+ * depth in that tree, which is what edge_nca() compares.
+ *
+ * Both edges leaving a block have the same immediate dominator, because
+ * a dominator of one of them dominates every path reaching the block and
+ * so dominates the other one too.
  */
 static void
 find_edom(opt_state_t *opt_state, struct block *root)
 {
-	u_int i;
-	uset x;
 	int level;
 	struct block *b;
 
-	x = opt_state->all_edge_sets;
-	/*
-	 * In opt_init(), we've made sure the product doesn't overflow.
-	 */
-	for (i = opt_state->n_blocks * opt_state->edgewords; i != 0; ) {
-		--i;
-		x[i] = 0xFFFFFFFFU;
-	}
-
 	/* root->level is the highest level no found. */
-	memset(root->edom, 0, opt_state->edgewords * sizeof(*(uset)0));
+	root->edom_parent = 0;
+	root->edom_depth = 1;
 	for (level = root->level; level >= 0; --level) {
 		for (b = opt_state->levels[level]; b != 0; b = b->link) {
-			propedom(opt_state, &b->et);
-			propedom(opt_state, &b->ef);
+			struct edge *ep, *nca;
+
+			if (b == root || b->in_edges == 0) {
+				b->edom_parent = 0;
+				b->edom_depth = 1;
+				continue;
+			}
+			nca = b->in_edges;
+			for (ep = nca; ep != 0; ep = ep->next)
+				if ((nca = edge_nca(nca, ep)) == 0)
+					break;
+			b->edom_parent = nca;
+			b->edom_depth = nca == 0 ? 1 : edge_depth(nca) + 1;
 		}
 	}
 }
@@ -1662,10 +1632,9 @@ fold_edge(struct block *child, struct edge *ep)
 static void
 opt_j(opt_state_t *opt_state, struct edge *ep)
 {
-	u_int i, k;
+	u_int i, k, ndom, njt;
 	struct block *target;
-	u_int selfword = (u_int)ep->id / BITS_PER_WORD;
-	bpf_u_int32 selfbit = (bpf_u_int32)1 << ((u_int)ep->id % BITS_PER_WORD);
+	struct edge *dp;
 
 	/*
 	 * Does this edge go to a block where, if the test
@@ -1715,62 +1684,70 @@ opt_j(opt_state_t *opt_state, struct edge *ep)
 		}
 	}
 	/*
+	 * Collect the dominators of this edge, which are the edges on the
+	 * path from the root of the edge dominator tree down to it, in
+	 * order of increasing id.
+	 *
+	 * Walking up the tree yields them deepest first.  A block is given
+	 * a lower id than every block it dominates, so within the jt edges
+	 * and within the jf edges that is the reverse of the order wanted,
+	 * and every jt edge has a lower id than every jf edge.
+	 *
+	 * The graph does not change while this runs, so the list is built
+	 * once and reused by every restart below.
+	 */
+	ndom = njt = 0;
+	for (dp = ep; dp != 0; dp = dp->pred->edom_parent) {
+		if (dp->id < opt_state->n_blocks)
+			njt++;
+		ndom++;
+	}
+	i = njt;
+	k = ndom;
+	for (dp = ep; dp != 0; dp = dp->pred->edom_parent) {
+		if (dp->id < opt_state->n_blocks)
+			opt_state->edom_list[--i] = dp;
+		else
+			opt_state->edom_list[--k] = dp;
+	}
+
+	/*
 	 * For each edge dominator that matches the successor of this
 	 * edge, promote the edge successor to the its grandchild.
-	 *
-	 * XXX We violate the set abstraction here in favor a reasonably
-	 * efficient loop.
 	 */
  top:
-	for (i = 0; i < opt_state->edgewords; ++i) {
+	for (i = 0; i < ndom; ++i) {
+		target = fold_edge(ep->succ, opt_state->edom_list[i]);
 		/*
-		 * i'th word in the bitset of dominators, which is the
-		 * one the block shares between its two edges, plus this
-		 * edge itself.
+		 * We have a candidate to replace the successor
+		 * of ep.
+		 *
+		 * Check that there is no data dependency between
+		 * nodes that will be violated if we move the edge;
+		 * i.e., if any register used on exit from the
+		 * candidate has a value at that point different
+		 * from the value it has when we exit the
+		 * predecessor of that edge, there's a data
+		 * dependency that will be violated.
 		 */
-		bpf_u_int32 x = ep->pred->edom[i];
-
-		if (i == selfword)
-			x |= selfbit;
-
-		while (x != 0) {
-			/* Find the next dominator in that word and mark it as found */
-			k = lowest_set_bit(x);
-			x &=~ ((bpf_u_int32)1 << k);
-			k += i * BITS_PER_WORD;
-
-			target = fold_edge(ep->succ, opt_state->edges[k]);
+		if (target != 0 && !use_conflict(ep->pred, target)) {
 			/*
-			 * We have a candidate to replace the successor
-			 * of ep.
+			 * It's safe to replace the successor of
+			 * ep; do so, and note that we've made
+			 * at least one change.
 			 *
-			 * Check that there is no data dependency between
-			 * nodes that will be violated if we move the edge;
-			 * i.e., if any register used on exit from the
-			 * candidate has a value at that point different
-			 * from the value it has when we exit the
-			 * predecessor of that edge, there's a data
-			 * dependency that will be violated.
+			 * XXX - this is one of the operations that
+			 * happens when the optimizer gets into
+			 * one of those infinite loops.
 			 */
-			if (target != 0 && !use_conflict(ep->pred, target)) {
+			opt_state->done = 0;
+			ep->succ = target;
+			if (JT(target) != 0)
 				/*
-				 * It's safe to replace the successor of
-				 * ep; do so, and note that we've made
-				 * at least one change.
-				 *
-				 * XXX - this is one of the operations that
-				 * happens when the optimizer gets into
-				 * one of those infinite loops.
+				 * Start over unless we hit a leaf.
 				 */
-				opt_state->done = 0;
-				ep->succ = target;
-				if (JT(target) != 0)
-					/*
-					 * Start over unless we hit a leaf.
-					 */
-					goto top;
-				return;
-			}
+				goto top;
+			return;
 		}
 	}
 }
@@ -1863,7 +1840,7 @@ or_pullup(opt_state_t *opt_state, struct block *b, struct block *root)
 		 *
 		 * Does b dominate diffp?
 		 */
-		if (!SET_MEMBER((*diffp)->dom, b->id))
+		if (!block_dominates(b, *diffp))
 			return;
 
 		/*
@@ -1909,7 +1886,7 @@ or_pullup(opt_state_t *opt_state, struct block *b, struct block *root)
 		 *
 		 * Does b dominate samep?
 		 */
-		if (!SET_MEMBER((*samep)->dom, b->id))
+		if (!block_dominates(b, *samep))
 			return;
 
 		/*
@@ -1997,7 +1974,7 @@ and_pullup(opt_state_t *opt_state, struct block *b, struct block *root)
 		if (JF(*diffp) != JF(b))
 			return;
 
-		if (!SET_MEMBER((*diffp)->dom, b->id))
+		if (!block_dominates(b, *diffp))
 			return;
 
 		if ((*diffp)->val[A_ATOM] != val)
@@ -2014,7 +1991,7 @@ and_pullup(opt_state_t *opt_state, struct block *b, struct block *root)
 		if (JF(*samep) != JF(b))
 			return;
 
-		if (!SET_MEMBER((*samep)->dom, b->id))
+		if (!block_dominates(b, *samep))
 			return;
 
 		if ((*samep)->val[A_ATOM] == val)
@@ -2389,7 +2366,8 @@ opt_cleanup(opt_state_t *opt_state)
 	free((void *)opt_state->vnode_base);
 	free((void *)opt_state->vmap);
 	free((void *)opt_state->edges);
-	free((void *)opt_state->space);
+	free((void *)opt_state->edom_list);
+	free((void *)opt_state->dom_stack);
 	free((void *)opt_state->levels);
 	free((void *)opt_state->blocks);
 }
@@ -2507,10 +2485,7 @@ count_stmts(struct icode *ic, struct block *p)
 static void
 opt_init(opt_state_t *opt_state, struct icode *ic)
 {
-	bpf_u_int32 *p;
 	int i, n, max_stmts;
-	u_int product;
-	size_t block_memsize, edge_memsize;
 
 	/*
 	 * First, count the blocks, so we can malloc an array to map
@@ -2551,77 +2526,29 @@ opt_init(opt_state_t *opt_state, struct icode *ic)
 		opt_error(opt_state, "malloc");
 	}
 
-	opt_state->edgewords = opt_state->n_edges / BITS_PER_WORD + 1;
-	opt_state->nodewords = opt_state->n_blocks / BITS_PER_WORD + 1;
 
 	/*
-	 * Make sure opt_state->n_blocks * opt_state->nodewords fits
-	 * in a u_int; we use it as a u_int number-of-iterations
-	 * value.
+	 * opt_j() collects the dominators of one edge here.  An edge
+	 * cannot have more dominators than there are edges.
 	 */
-	product = opt_state->n_blocks * opt_state->nodewords;
-	if ((product / opt_state->n_blocks) != opt_state->nodewords) {
-		/*
-		 * XXX - just punt and don't try to optimize?
-		 * In practice, this is unlikely to happen with
-		 * a normal filter.
-		 */
-		opt_error(opt_state, "filter is too complex to optimize");
-	}
-
-	/*
-	 * Make sure the total memory required for that doesn't
-	 * overflow.
-	 */
-	block_memsize = (size_t)product * sizeof(*opt_state->space);
-	if ((block_memsize / product) != sizeof(*opt_state->space)) {
-		opt_error(opt_state, "filter is too complex to optimize");
-	}
-
-	/*
-	 * Make sure opt_state->n_blocks * opt_state->edgewords fits
-	 * in a u_int; we use it as a u_int number-of-iterations
-	 * value.
-	 */
-	product = opt_state->n_blocks * opt_state->edgewords;
-	if ((product / opt_state->n_blocks) != opt_state->edgewords) {
-		opt_error(opt_state, "filter is too complex to optimize");
-	}
-
-	/*
-	 * Make sure the total memory required for that doesn't
-	 * overflow.
-	 */
-	edge_memsize = (size_t)product * sizeof(*opt_state->space);
-	if (edge_memsize / product != sizeof(*opt_state->space)) {
-		opt_error(opt_state, "filter is too complex to optimize");
-	}
-
-	/*
-	 * Make sure the total memory required for both of them doesn't
-	 * overflow.
-	 */
-	if (block_memsize > SIZE_MAX - edge_memsize) {
-		opt_error(opt_state, "filter is too complex to optimize");
-	}
-
-	/* XXX */
-	opt_state->space = (bpf_u_int32 *)malloc(block_memsize + edge_memsize);
-	if (opt_state->space == NULL) {
+	opt_state->edom_list = (struct edge **)calloc(opt_state->n_edges,
+	    sizeof(*opt_state->edom_list));
+	if (opt_state->edom_list == NULL) {
 		opt_error(opt_state, "malloc");
 	}
-	p = opt_state->space;
-	opt_state->all_dom_sets = p;
-	for (i = 0; i < n; ++i) {
-		opt_state->blocks[i]->dom = p;
-		p += opt_state->nodewords;
+
+	/*
+	 * find_dom() pushes each block of the dominator tree once.
+	 */
+	opt_state->dom_stack = (struct block **)calloc(opt_state->n_blocks,
+	    sizeof(*opt_state->dom_stack));
+	if (opt_state->dom_stack == NULL) {
+		opt_error(opt_state, "malloc");
 	}
-	opt_state->all_edge_sets = p;
+
 	for (i = 0; i < n; ++i) {
 		struct block *b = opt_state->blocks[i];
 
-		b->edom = p;
-		p += opt_state->edgewords;
 		b->et.id = i;
 		opt_state->edges[i] = &b->et;
 		b->ef.id = opt_state->n_blocks + i;

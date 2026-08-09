@@ -226,7 +226,6 @@ typedef bpf_u_int32 atomset;
 /*
  * An unbounded set.
  */
-typedef bpf_u_int32 *uset;
 
 /*
  * Total number of atomic entities, including accumulator (A) and index (X).
@@ -266,8 +265,13 @@ struct block {
 	struct edge ef;		/* edge corresponding to the jf branch */
 	struct block *head;
 	struct block *link;	/* link field used by optimizer */
-	uset dom;
-	uset edom;		/* edge dominators, shared by this block's two edges */
+	struct block *dom_parent;	/* immediate dominator */
+	struct block *dom_child;	/* first child in the dominator tree */
+	struct block *dom_sib;		/* next sibling in the dominator tree */
+	u_int dom_depth;		/* depth in the dominator tree */
+	u_int dom_first, dom_last;	/* depth-first numbering of that tree */
+	struct edge *edom_parent;	/* immediate dominator of this block's two edges */
+	u_int edom_depth;		/* depth of those edges in the edge dominator tree */
 	struct edge *in_edges;	/* first edge in the set (linked list) of edges with this as a successor */
 	atomset def, kill;
 	atomset in_use;
