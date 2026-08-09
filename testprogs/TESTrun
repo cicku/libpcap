@@ -27158,6 +27158,36 @@ my @filter_apply_blocks = (
 		expr => 'outbound',
 		results => [0, 262144, 0, 262144, 0, 262144, 262144, 0],
 	},
+
+	# The two tests below produce programs long enough that some branches
+	# cannot reach their target with the 8-bit offset of a BPF branch, so
+	# convert_code_r() has to insert BPF_JA instructions and lay the
+	# program out again.  Nothing else in this file gets anywhere near the
+	# 255-instruction limit, so without these the long jump code never
+	# runs.  The trailing "or udp" is what makes the expected results tell
+	# a working program from a broken one: none of the generated terms
+	# matches anything in the savefile, so the results come from the last
+	# term, which the long jumps have to skip over correctly.
+	#
+	# Both terms of each expression are needed.  Keep an eye on the
+	# instruction counts if these are ever changed: at the time of writing
+	# the first expression compiles to 321 instructions with 7 long jumps
+	# optimized and 992 with 58 unoptimized, and the second to 275 with 3
+	# and 1791 with 217.
+	{
+		name => 'longjump_or_chain',
+		savefile => 'isakmp4500.pcap',
+		expr => '(' . join (' or ',
+		    map {"(host 10.0.0.$_ and port 1$_)"} 1 .. 20) . ') or udp',
+		results => [0, 0, 1536, 1536, 1536, 1536, 1536, 1536, 1536, 1536],
+	},
+	{
+		name => 'longjump_and_chain',
+		savefile => 'isakmp4500.pcap',
+		expr => '(' . join (' and ',
+		    map {sprintf 'ip[%d] = %d', $_, $_ * 7 % 251} 1 .. 130) . ') or udp',
+		results => [0, 0, 1536, 1536, 1536, 1536, 1536, 1536, 1536, 1536],
+	},
 );
 
 # yyerror()
