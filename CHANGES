@@ -61,6 +61,10 @@ DayOfTheWeek, Month DD, YYYY / The Tcpdump Group
       Place all long jumps in one pass, not one pass per long jump, so
         that compiling a large filter is no longer quadratic in the
         number of them. (issue #1255)
+      Halve the memory the optimizer needs for a large filter, by
+        removing the closure sets, which nothing read, and sharing one
+        edge dominator set between the two edges of a block. (issue
+        #1255)
     Capture file reading:
       Fix misaligned accesses in processing Linux USB captures (issue
         #1634, reported by FuzzAnything Organization
