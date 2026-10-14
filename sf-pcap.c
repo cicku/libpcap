@@ -988,7 +988,7 @@ pcap_dump_open_append(pcap_t *p, const char *fname)
 	if (linktype == -1) {
 		snprintf(p->errbuf, PCAP_ERRBUF_SIZE,
 		    "%s: link-layer type %d isn't supported in savefiles",
-		    fname, linktype);
+		    fname, p->linktype);
 		return (NULL);
 	}
 
